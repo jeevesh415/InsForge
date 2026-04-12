@@ -14,9 +14,17 @@ export class LocalStorageProvider implements StorageProvider {
     await fs.mkdir(this.baseDir, { recursive: true });
   }
 
-  private getValidatedPath(...parts: string[]): string {
+  private getValidatedPath(bucket: string, ...parts: string[]): string {
+    if (!bucket || bucket.trim() === '') {
+      throw new Error('Invalid bucket name');
+    }
+
+    if (!/^[a-zA-Z0-9-_]+$/.test(bucket)) {
+      throw new Error('Bucket name contains invalid characters');
+    }
+
     const resolvedBaseDir = path.resolve(this.baseDir);
-    const resolvedPath = path.resolve(this.baseDir, ...parts);
+    const resolvedPath = path.resolve(this.baseDir, bucket, ...parts);
     const relativePath = path.relative(resolvedBaseDir, resolvedPath);
 
     if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
@@ -85,7 +93,8 @@ export class LocalStorageProvider implements StorageProvider {
   getUploadStrategy(
     bucket: string,
     key: string,
-    _metadata: { contentType?: string; size?: number }
+    _metadata: { contentType?: string; size?: number },
+    _maxFileSizeBytes: number
   ): Promise<UploadStrategyResponse> {
     // For local storage, return direct upload strategy with absolute URL
     const baseUrl = getApiBaseUrl();
@@ -111,15 +120,18 @@ export class LocalStorageProvider implements StorageProvider {
     });
   }
 
-  async verifyObjectExists(bucket: string, key: string): Promise<boolean> {
-    // For local storage, check if file exists on disk
+  async verifyObjectExists(
+    bucket: string,
+    key: string
+  ): Promise<{ exists: boolean; size?: number }> {
+    // For local storage, check if file exists on disk and get its size
     try {
       const filePath = this.getFilePath(bucket, key);
-      await fs.access(filePath);
-      return true;
+      const stat = await fs.stat(filePath);
+      return { exists: true, size: stat.size };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        return false;
+        return { exists: false };
       }
       throw error;
     }
