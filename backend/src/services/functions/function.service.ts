@@ -8,12 +8,14 @@ import {
   DeploymentResult,
 } from '@insforge/shared-schemas';
 import logger from '@/utils/logger.js';
-import { DatabaseError, Pool } from 'pg';
+import { Pool } from 'pg';
 import fetch from 'node-fetch';
 import { AppError } from '@/api/middlewares/error.js';
 import { ERROR_CODES } from '@/types/error-constants.js';
+import { hasPgErrorCode } from '@/utils/errors.js';
 import { DenoSubhostingProvider } from '@/providers/functions/deno-subhosting.provider.js';
 import { SecretService } from '@/services/secrets/secret.service.js';
+import { isCloudEnvironment } from '@/utils/environment.js';
 
 export class FunctionService {
   private static instance: FunctionService;
@@ -185,7 +187,7 @@ export class FunctionService {
         operation: 'createFunction',
       });
 
-      if (error instanceof DatabaseError && error.code === '23505') {
+      if (hasPgErrorCode(error, '23505')) {
         throw new AppError(
           'Function with this slug already exists',
           409,
@@ -361,18 +363,33 @@ export class FunctionService {
     }
 
     const dangerousPatterns = [
-      /Deno\.run/i,
-      /Deno\.spawn/i,
-      /Deno\.Command/i,
-      /child_process/i,
-      /process\.exit/i,
-      /require\(['"]fs['"]\)/i,
+      /globalThis/i,
+      /\bself\b/i,
+      /\bprocess\b/i,
+      /Deno\.(run|spawn|Command|makeTemp|remove|write|chmod|chown)/i,
+      /\bimport\b[^;]*\(/i, // Block dynamic imports even with comments (e.g., import /* */ ('...'))
+      /require\b/i,
+      /eval\b/i,
+      /\bFunction\s*\(/, // Case-sensitive: Block constructor but allow 'function' keyword
+
+      /\.constructor\b|__proto__/i, // Block property-based constructor access; allow class constructor() declarations
+      /\bDeno\s*\[|\bprocess\s*\[|\bglobalThis\s*\[/i, // Block bracket notation property access like obj['Deno']
     ];
 
+    /**
+     * TIER 1 VALIDATION (Convenience Filter):
+     * This regex suite is a high-level filter designed to reject obvious malicious patterns
+     * at the API layer. The ACTUAL enforcement boundary is the Tier 2 native Deno sandbox
+     * (permissions: false) which blocks the underlying syscalls.
+     */
     for (const pattern of dangerousPatterns) {
       if (pattern.test(code)) {
+        logger.warn('Dangerous code pattern blocked', {
+          pattern: pattern.toString(),
+          codeLength: code.length,
+        });
         throw new AppError(
-          `Code contains potentially dangerous pattern: ${pattern.toString()}`,
+          'Code contains a potentially dangerous pattern.',
           400,
           ERROR_CODES.INVALID_INPUT
         );
@@ -778,8 +795,8 @@ export class FunctionService {
 
   /**
    * Get all active secrets for function injection
-   * Note: INSFORGE_INTERNAL_URL is replaced with INSFORGE_BASE_URL value
-   * since internal URLs don't work from Deno Subhosting
+   * In cloud deployments, INSFORGE_INTERNAL_URL is replaced with INSFORGE_BASE_URL
+   * because the internal container URL is not reachable from Deno Subhosting.
    */
   private async getFunctionSecrets(): Promise<Record<string, string>> {
     try {
@@ -800,9 +817,8 @@ export class FunctionService {
         }
       }
 
-      // Replace INSFORGE_INTERNAL_URL with INSFORGE_BASE_URL value
-      // so existing functions using internal URL still work
-      if (baseUrlValue && secretMap['INSFORGE_INTERNAL_URL']) {
+      // Preserve OSS container-to-container routing while keeping cloud compatibility.
+      if (isCloudEnvironment() && baseUrlValue && secretMap['INSFORGE_INTERNAL_URL']) {
         secretMap['INSFORGE_INTERNAL_URL'] = baseUrlValue;
       }
 

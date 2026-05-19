@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react';
 import { Download, ExternalLink } from 'lucide-react';
 import { Button, Dialog, DialogContent, DialogDescription, DialogTitle } from '@insforge/ui';
-import { LoadingState, TypeBadge } from '../../../components';
-import { useStorage } from '../hooks/useStorage';
+import { LoadingState, TypeBadge } from '#components';
+import { useStorageObjects } from '#features/storage/hooks/useStorageObjects';
 import { StorageFileSchema } from '@insforge/shared-schemas';
 
 interface FilePreviewDialogProps {
@@ -17,7 +17,7 @@ export function FilePreviewDialog({ open, onOpenChange, file, bucket }: FilePrev
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const { downloadObject } = useStorage();
+  const { downloadObject } = useStorageObjects();
 
   // Reset state when file changes
   useEffect(() => {

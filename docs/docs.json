@@ -40,6 +40,8 @@
                 "group": "Database",
                 "pages": [
                   "core-concepts/database/architecture",
+                  "core-concepts/database/migrations",
+                  "core-concepts/database/branching",
                   "core-concepts/database/pgvector"
                 ]
               },
@@ -52,7 +54,8 @@
               {
                 "group": "Storage",
                 "pages": [
-                  "core-concepts/storage/architecture"
+                  "core-concepts/storage/architecture",
+                  "core-concepts/storage/s3-compatibility"
                 ]
               },
               {
@@ -75,15 +78,29 @@
                 ]
               },
               {
-                "group": "Email (Experimental)",
+                "group": "Email (Private Preview)",
                 "pages": [
-                  "core-concepts/email/architecture"
+                  "core-concepts/email/architecture",
+                  "core-concepts/email/custom-smtp"
                 ]
               },
               {
-                "group": "Deployments (Experimental)",
+                "group": "Deployments",
                 "pages": [
                   "core-concepts/deployments/architecture"
+                ]
+              },
+              {
+                "group": "Payments (Private Preview)",
+                "pages": [
+                  "core-concepts/payments/architecture",
+                  "core-concepts/payments/cli"
+                ]
+              },
+              {
+                "group": "Compute (Private Preview)",
+                "pages": [
+                  "core-concepts/compute/architecture"
                 ]
               }
             ]
@@ -119,14 +136,7 @@
               "sdks/typescript/ai",
               "sdks/typescript/realtime",
               "sdks/typescript/email",
-              {
-                "group": "UI Components",
-                "pages": [
-                  "sdks/typescript/ui-components/react",
-                  "sdks/typescript/ui-components/nextjs",
-                  "sdks/typescript/ui-components/customization"
-                ]
-              },
+              "sdks/typescript/payments",
               {
                 "group": "Framework Guides",
                 "pages": [
@@ -218,6 +228,10 @@
           {
             "group": "Email",
             "openapi": "https://raw.githubusercontent.com/InsForge/InsForge/main/openapi/email.yaml"
+          },
+          {
+            "group": "Payments (Private Preview)",
+            "openapi": "https://raw.githubusercontent.com/InsForge/InsForge/main/openapi/payments.yaml"
           },
           {
             "group": "Secrets",

@@ -7,12 +7,26 @@ export function CloudHostingDashboard() {
     getAuthorizationCode,
     projectInfo,
     reportRouteChange,
-    navigateToSubscription,
+    showUpgradeDialog,
     renameProject,
     deleteProject,
+    requestBackupInfo,
+    createBackup,
+    deleteBackup,
+    renameBackup,
+    restoreBackup,
     requestInstanceInfo,
     requestInstanceTypeChange,
     updateVersion,
+    requestUserInfo,
+    requestUserApiKey,
+    requestModelCredits,
+    requestProjectMetrics,
+    requestAdvisorLatest,
+    requestAdvisorIssues,
+    triggerAdvisorScan,
+    connectPosthog,
+    subscribePosthogConnectionStatus,
   } = useCloudHosting();
 
   return (
@@ -20,14 +34,29 @@ export function CloudHostingDashboard() {
       mode="cloud-hosting"
       showNavbar={!isInIframe()}
       getAuthorizationCode={getAuthorizationCode}
+      useAuthorizationCodeRefresh={isInIframe()}
       project={projectInfo}
       onRouteChange={reportRouteChange}
-      onNavigateToSubscription={navigateToSubscription}
+      onShowUpgradeDialog={showUpgradeDialog}
       onRenameProject={renameProject}
       onDeleteProject={deleteProject}
+      onRequestBackupInfo={requestBackupInfo}
+      onCreateBackup={createBackup}
+      onDeleteBackup={deleteBackup}
+      onRenameBackup={renameBackup}
+      onRestoreBackup={restoreBackup}
       onRequestInstanceInfo={requestInstanceInfo}
       onRequestInstanceTypeChange={requestInstanceTypeChange}
       onUpdateVersion={updateVersion}
+      onRequestUserInfo={requestUserInfo}
+      onRequestUserApiKey={requestUserApiKey}
+      onRequestModelCredits={requestModelCredits}
+      onRequestProjectMetrics={requestProjectMetrics}
+      onRequestAdvisorLatest={requestAdvisorLatest}
+      onRequestAdvisorIssues={requestAdvisorIssues}
+      onTriggerAdvisorScan={triggerAdvisorScan}
+      onConnectPosthog={connectPosthog}
+      subscribePosthogConnectionStatus={subscribePosthogConnectionStatus}
     />
   );
 }

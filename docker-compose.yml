@@ -102,6 +102,10 @@ services:
       - AWS_CLOUDFRONT_URL=${AWS_CLOUDFRONT_URL:-}
       - AWS_CLOUDFRONT_KEY_PAIR_ID=${AWS_CLOUDFRONT_KEY_PAIR_ID:-}
       - AWS_CLOUDFRONT_PRIVATE_KEY=${AWS_CLOUDFRONT_PRIVATE_KEY:-}
+      # Deployment Configuration
+      - VERCEL_TOKEN=${VERCEL_TOKEN:-}
+      - VERCEL_TEAM_ID=${VERCEL_TEAM_ID:-}
+      - VERCEL_PROJECT_ID=${VERCEL_PROJECT_ID:-}
       # Multi-tenant Cloud Configuration
       - DEPLOYMENT_ID=${DEPLOYMENT_ID:-}
       - PROJECT_ID=${PROJECT_ID:-}
@@ -110,6 +114,9 @@ services:
       - CLOUD_API_HOST=${CLOUD_API_HOST:-}
       # LLM Model API keys
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      # Stripe Payments Configuration
+      - STRIPE_TEST_SECRET_KEY=${STRIPE_TEST_SECRET_KEY:-}
+      - STRIPE_LIVE_SECRET_KEY=${STRIPE_LIVE_SECRET_KEY:-}
       # OAuth Configuration
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
@@ -125,6 +132,16 @@ services:
       - X_CLIENT_SECRET=${X_CLIENT_SECRET:-}
       - APPLE_CLIENT_ID=${APPLE_CLIENT_ID:-}
       - APPLE_CLIENT_SECRET=${APPLE_CLIENT_SECRET:-}
+      # Compute Services (Fly.io self-host). Auto-enables when both
+      # FLY_API_TOKEN and FLY_ORG are set. Cloud-proxied mode activates
+      # automatically when PROJECT_ID, CLOUD_API_HOST, and JWT_SECRET are set.
+      - FLY_API_TOKEN=${FLY_API_TOKEN:-}
+      - FLY_ORG=${FLY_ORG:-}
+      - COMPUTE_DOMAIN=${COMPUTE_DOMAIN:-}
+      # Test-only: when "1", bypass the per-IP write rate limiters in
+      # backend/src/api/middlewares/rate-limiters.ts so e2e suites can run
+      # many writes from a single IP without hitting 429. Never set in prod.
+      - INSFORGE_DISABLE_WRITE_RATE_LIMIT=${INSFORGE_DISABLE_WRITE_RATE_LIMIT:-}
       # Logs directory
       - LOGS_DIR=/insforge-logs
       # Storage directory (for local file storage when S3 is not configured)
@@ -184,43 +201,9 @@ services:
         echo 'Downloading Deno dependencies...' &&
         deno cache functions/server.ts &&
         echo 'Starting Deno server on port 7133...' &&
-        deno run --allow-net --allow-env --allow-read=./functions/worker-template.js --watch functions/server.ts
+        deno run --allow-net --allow-env --allow-read=./functions/worker-template.js --unstable-worker-options --watch functions/server.ts
       "
     restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-    networks:
-      - insforge-network
-
-  # Vector.dev for log collection and shipping
-  vector:
-    image: timberio/vector:0.28.1-alpine
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-      postgrest:
-        condition: service_started
-      insforge:
-        condition: service_started
-      deno:
-        condition: service_started
-    volumes:
-      - ./deploy/docker-init/logs/vector.yml:/etc/vector/vector.yml:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - shared-logs:/insforge-logs
-    healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:7135/health"]
-      timeout: 5s
-      interval: 5s
-      retries: 3
-    environment:
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
-      - AWS_REGION=${AWS_REGION:-skip}
-      - PROJECT_ID=${PROJECT_ID:-}
-      - HOSTNAME_OVERRIDE=${HOSTNAME_OVERRIDE:-}
-    command: ["--config", "/etc/vector/vector.yml"]
     security_opt:
       - no-new-privileges:true
     networks:

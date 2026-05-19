@@ -10,12 +10,14 @@ import {
 } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { useQueryClient } from '@tanstack/react-query';
-import { apiClient } from '../api/client';
+import { apiClient } from '#lib/api/client';
 import { useAuth } from './AuthContext';
-import { getDashboardBackendUrl } from '../config/runtime';
+import { getDashboardBackendUrl } from '#lib/config/runtime';
 import type { SocketMessage } from '@insforge/shared-schemas';
-import { useMcpUsage } from '../../features/logs/hooks/useMcpUsage';
-import { trackPostHog, getFeatureFlag } from '../analytics/posthog';
+import { databaseTableQueryKeys } from '#features/database/queryKeys';
+import { parseDatabaseTableReference } from '#features/database/helpers';
+import { useMcpUsage } from '#features/logs/hooks/useMcpUsage';
+import { trackPostHog, getFeatureFlag } from '#lib/analytics/posthog';
 
 // ============================================================================
 // Types & Enums
@@ -41,11 +43,19 @@ export enum DataUpdateResourceType {
   FUNCTIONS = 'functions',
   DEPLOYMENTS = 'deployments',
   REALTIME = 'realtime',
-  AI_USAGE = 'ai_usage',
 }
 
 export interface DatabaseResourceUpdate {
-  type: 'tables' | 'table' | 'records' | 'index' | 'trigger' | 'policy' | 'function' | 'extension';
+  type:
+    | 'tables'
+    | 'table'
+    | 'records'
+    | 'index'
+    | 'trigger'
+    | 'policy'
+    | 'function'
+    | 'extension'
+    | 'migration';
   name?: string;
 }
 
@@ -222,7 +232,7 @@ export function SocketProvider({ children }: SocketProviderProps) {
     (toolName: string) => {
       if (mcpUsageCount === 1) {
         trackPostHog('onboarding_completed', {
-          experiment_variant: getFeatureFlag('dashboard-v2-experiment'),
+          experiment_variant: getFeatureFlag('dashboard-v4-experiment'),
           tool_name: toolName,
         });
       }
@@ -254,20 +264,26 @@ export function SocketProvider({ children }: SocketProviderProps) {
             switch (change.type) {
               case 'tables':
                 // CREATE TABLE / DROP TABLE - affects table list
-                void queryClient.invalidateQueries({ queryKey: ['tables'] });
+                void queryClient.invalidateQueries({ queryKey: ['database', 'tables'] });
                 void queryClient.invalidateQueries({ queryKey: ['metadata', 'full'] });
                 break;
               case 'table':
                 // ALTER TABLE / RENAME - affects specific table and list
-                void queryClient.invalidateQueries({ queryKey: ['tables'] });
+                void queryClient.invalidateQueries({ queryKey: ['database', 'tables'] });
                 if (change.name) {
-                  void queryClient.invalidateQueries({ queryKey: ['table', change.name] });
+                  const { schemaName, tableName } = parseDatabaseTableReference(change.name);
+                  void queryClient.invalidateQueries({
+                    queryKey: databaseTableQueryKeys.tableSchema(schemaName, tableName),
+                  });
                 }
                 break;
               case 'records':
                 // INSERT / UPDATE / DELETE - affects records for specific table
                 if (change.name) {
-                  void queryClient.invalidateQueries({ queryKey: ['records', change.name] });
+                  const { schemaName, tableName } = parseDatabaseTableReference(change.name);
+                  void queryClient.invalidateQueries({
+                    queryKey: ['records', schemaName, tableName],
+                  });
                 }
                 // Record count changed — refresh metadata so dashboard steps update
                 void queryClient.invalidateQueries({ queryKey: ['metadata', 'full'] });
@@ -286,6 +302,9 @@ export function SocketProvider({ children }: SocketProviderProps) {
                 break;
               case 'extension':
                 // Extensions are not supported yet
+                break;
+              case 'migration':
+                void queryClient.invalidateQueries({ queryKey: ['database', 'migrations'] });
                 break;
             }
           }
@@ -306,9 +325,6 @@ export function SocketProvider({ children }: SocketProviderProps) {
           break;
         case DataUpdateResourceType.REALTIME:
           void queryClient.invalidateQueries({ queryKey: ['realtime'] });
-          break;
-        case DataUpdateResourceType.AI_USAGE:
-          void queryClient.invalidateQueries({ queryKey: ['ai-usage-summary'] });
           break;
       }
     };

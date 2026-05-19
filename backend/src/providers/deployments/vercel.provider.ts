@@ -1,11 +1,22 @@
 import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
+import type { Readable } from 'stream';
 import { isCloudEnvironment } from '@/utils/environment.js';
 import { AppError } from '@/api/middlewares/error.js';
 import { ERROR_CODES } from '@/types/error-constants.js';
 import { SecretService } from '@/services/secrets/secret.service.js';
 import logger from '@/utils/logger.js';
+
+const VERCEL_UPLOAD_TIMEOUT_MS = 120_000;
+
+// Rate-limit retry configuration for Vercel file uploads
+const UPLOAD_MAX_RETRIES = 3;
+const UPLOAD_BACKOFF_BASE_MS = 1000;
+const UPLOAD_BACKOFF_MAX_MS = 30000;
+const UPLOAD_JITTER_MAX_MS = 500;
+const UPLOAD_BATCH_SIZE = 5;
+const UPLOAD_INTER_BATCH_DELAY_MS = 200;
 
 interface CloudCredentialsResponse {
   team_id: string;
@@ -95,6 +106,88 @@ export interface VercelProjectDomain {
   verification?: Array<{ type: string; domain: string; value: string; reason: string }>;
 }
 
+export interface VercelRateLimitRetryOptions {
+  maxRetries: number;
+  /** Base delay for exponential schedule when X-RateLimit-Reset is missing. */
+  baseDelayMs: number;
+  /** Cap on the computed delay so a wildly-future reset header doesn't stall the worker. */
+  maxDelayMs: number;
+  /** Max jitter (ms) added on top of the base. */
+  jitterMaxMs: number;
+}
+
+/**
+ * Wrap any Vercel API call so HTTP 429 responses trigger an exponential-backoff
+ * retry. Vercel returns `X-RateLimit-Reset` as a Unix epoch (seconds); when
+ * present we wait until that instant (capped at `maxDelayMs`). Otherwise we
+ * fall back to `2^attempt * baseDelayMs + jitter`. The final delay (base +
+ * jitter) is clamped to `maxDelayMs` so jitter cannot push the wait past the
+ * intended cap.
+ *
+ * On 429 retry exhaustion the helper throws `AppError(429, RATE_LIMITED)`
+ * rather than the raw axios error, so callers can rethrow it as-is and have
+ * the rate-limit semantics surface to the client instead of being flattened
+ * to a generic 500 INTERNAL_ERROR.
+ *
+ * Used by these write endpoints: createDeployment, cancelDeployment,
+ * upsertEnvironmentVariables, addCustomDomain, removeCustomDomain,
+ * verifyCustomDomain. uploadFile keeps its own bespoke streaming-aware
+ * retry loop and is intentionally NOT wrapped by this helper.
+ */
+export async function withVercelRateLimitRetry<T>(
+  op: () => Promise<T>,
+  opts: VercelRateLimitRetryOptions
+): Promise<T> {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await op();
+    } catch (error: unknown) {
+      const isAxios429 = axios.isAxiosError(error) && error.response?.status === 429;
+
+      if (!isAxios429) {
+        throw error;
+      }
+      if (attempt >= opts.maxRetries) {
+        throw new AppError(
+          'Vercel rate limit exceeded after retries. Please retry shortly.',
+          429,
+          ERROR_CODES.RATE_LIMITED
+        );
+      }
+
+      const headers = error.response?.headers ?? {};
+      const reset = headers['x-ratelimit-reset'];
+      const parsedReset = reset !== undefined && reset !== null ? parseInt(String(reset), 10) : NaN;
+      let baseDelay: number;
+      if (!isNaN(parsedReset)) {
+        const resetMs = parsedReset * 1000;
+        baseDelay = Math.min(Math.max(resetMs - Date.now(), opts.baseDelayMs), opts.maxDelayMs);
+      } else {
+        baseDelay = Math.min(2 ** attempt * opts.baseDelayMs, opts.maxDelayMs);
+      }
+      const delay = Math.min(
+        baseDelay + Math.floor(Math.random() * opts.jitterMaxMs),
+        opts.maxDelayMs
+      );
+      logger.warn('Vercel rate limit hit — retrying', {
+        attempt: attempt + 1,
+        maxRetries: opts.maxRetries,
+        delayMs: Math.round(delay),
+      });
+      await new Promise((res) => setTimeout(res, delay));
+      attempt++;
+    }
+  }
+}
+
+export const DEFAULT_VERCEL_RATE_LIMIT_OPTS: VercelRateLimitRetryOptions = {
+  maxRetries: 3,
+  baseDelayMs: 1000,
+  maxDelayMs: 30_000,
+  jitterMaxMs: 250,
+};
+
 export class VercelProvider {
   private static instance: VercelProvider;
   private cloudCredentials: VercelCredentials | undefined;
@@ -110,6 +203,37 @@ export class VercelProvider {
       VercelProvider.instance = new VercelProvider();
     }
     return VercelProvider.instance;
+  }
+
+  private createUploadAbortController(signal?: AbortSignal): {
+    controller: AbortController;
+    cleanup: () => void;
+  } {
+    const controller = new AbortController();
+
+    if (!signal) {
+      return { controller, cleanup: () => undefined };
+    }
+
+    if (signal.aborted) {
+      controller.abort(signal.reason);
+      return { controller, cleanup: () => undefined };
+    }
+
+    const handleAbort = () => controller.abort(signal.reason);
+    signal.addEventListener('abort', handleAbort, { once: true });
+
+    return {
+      controller,
+      cleanup: () => signal.removeEventListener('abort', handleAbort),
+    };
+  }
+
+  private isUploadTimeoutError(error: unknown): boolean {
+    return (
+      axios.isAxiosError(error) &&
+      (error.code === 'ECONNABORTED' || error.message.toLowerCase().includes('timeout'))
+    );
   }
 
   /**
@@ -275,17 +399,21 @@ export class VercelProvider {
     const credentials = await this.getCredentials();
 
     try {
-      const response = await axios.post(
-        `https://api.vercel.com/v13/deployments?teamId=${credentials.teamId}&skipAutoDetectionConfirmation=1`,
-        {
-          name: options.name || 'deployment',
-          target: 'production',
-          project: credentials.projectId,
-          files: options.files,
-          projectSettings: options.projectSettings,
-          meta: options.meta,
-        },
-        { headers: { Authorization: `Bearer ${credentials.token}` } }
+      const response = await withVercelRateLimitRetry(
+        () =>
+          axios.post(
+            `https://api.vercel.com/v13/deployments?teamId=${credentials.teamId}&skipAutoDetectionConfirmation=1`,
+            {
+              name: options.name || 'deployment',
+              target: 'production',
+              project: credentials.projectId,
+              files: options.files,
+              projectSettings: options.projectSettings,
+              meta: options.meta,
+            },
+            { headers: { Authorization: `Bearer ${credentials.token}` } }
+          ),
+        DEFAULT_VERCEL_RATE_LIMIT_OPTS
       );
 
       const deployment = response.data;
@@ -305,6 +433,9 @@ export class VercelProvider {
         createdAt: new Date(deployment.createdAt),
       };
     } catch (error) {
+      if (error instanceof AppError) {
+        throw error;
+      }
       logger.error('Failed to create Vercel deployment', {
         error: error instanceof Error ? error.message : String(error),
       });
@@ -360,13 +491,20 @@ export class VercelProvider {
     const credentials = await this.getCredentials();
 
     try {
-      await axios.patch(
-        `https://api.vercel.com/v12/deployments/${deploymentId}/cancel?teamId=${credentials.teamId}`,
-        {},
-        { headers: { Authorization: `Bearer ${credentials.token}` } }
+      await withVercelRateLimitRetry(
+        () =>
+          axios.patch(
+            `https://api.vercel.com/v12/deployments/${deploymentId}/cancel?teamId=${credentials.teamId}`,
+            {},
+            { headers: { Authorization: `Bearer ${credentials.token}` } }
+          ),
+        DEFAULT_VERCEL_RATE_LIMIT_OPTS
       );
       logger.info('Vercel deployment cancelled', { deploymentId });
     } catch (error) {
+      if (error instanceof AppError) {
+        throw error;
+      }
       logger.error('Failed to cancel Vercel deployment', {
         error: error instanceof Error ? error.message : String(error),
         deploymentId,
@@ -389,10 +527,14 @@ export class VercelProvider {
         target: ['production', 'preview', 'development'],
       }));
 
-      await axios.post(
-        `https://api.vercel.com/v10/projects/${credentials.projectId}/env?teamId=${credentials.teamId}&upsert=true`,
-        payload,
-        { headers: { Authorization: `Bearer ${credentials.token}` } }
+      await withVercelRateLimitRetry(
+        () =>
+          axios.post(
+            `https://api.vercel.com/v10/projects/${credentials.projectId}/env?teamId=${credentials.teamId}&upsert=true`,
+            payload,
+            { headers: { Authorization: `Bearer ${credentials.token}` } }
+          ),
+        DEFAULT_VERCEL_RATE_LIMIT_OPTS
       );
 
       logger.info('Environment variables upserted', {
@@ -400,6 +542,9 @@ export class VercelProvider {
         keys: envVars.map((e) => e.key),
       });
     } catch (error) {
+      if (error instanceof AppError) {
+        throw error;
+      }
       logger.error('Failed to upsert environment variables', {
         error: error instanceof Error ? error.message : String(error),
       });
@@ -538,13 +683,20 @@ export class VercelProvider {
     const credentials = await this.getCredentials();
 
     try {
-      await axios.delete(
-        `https://api.vercel.com/v10/projects/${credentials.projectId}/env/${envId}?teamId=${credentials.teamId}`,
-        { headers: { Authorization: `Bearer ${credentials.token}` } }
+      await withVercelRateLimitRetry(
+        () =>
+          axios.delete(
+            `https://api.vercel.com/v10/projects/${credentials.projectId}/env/${envId}?teamId=${credentials.teamId}`,
+            { headers: { Authorization: `Bearer ${credentials.token}` } }
+          ),
+        DEFAULT_VERCEL_RATE_LIMIT_OPTS
       );
 
       logger.info('Environment variable deleted', { envId });
     } catch (error) {
+      if (error instanceof AppError) {
+        throw error;
+      }
       if (axios.isAxiosError(error) && error.response?.status === 404) {
         throw new AppError(`Environment variable not found: ${envId}`, 404, ERROR_CODES.NOT_FOUND);
       }
@@ -719,15 +871,22 @@ export class VercelProvider {
     const credentials = await this.getCredentials();
 
     try {
-      const response = await axios.post(
-        `https://api.vercel.com/v10/projects/${credentials.projectId}/domains?teamId=${credentials.teamId}`,
-        { name: domain },
-        { headers: { Authorization: `Bearer ${credentials.token}` } }
+      const response = await withVercelRateLimitRetry(
+        () =>
+          axios.post(
+            `https://api.vercel.com/v10/projects/${credentials.projectId}/domains?teamId=${credentials.teamId}`,
+            { name: domain },
+            { headers: { Authorization: `Bearer ${credentials.token}` } }
+          ),
+        DEFAULT_VERCEL_RATE_LIMIT_OPTS
       );
 
       logger.info('Custom domain added to Vercel project', { domain });
       return response.data;
     } catch (error) {
+      if (error instanceof AppError) {
+        throw error;
+      }
       if (axios.isAxiosError(error)) {
         const status = error.response?.status;
         const msg = (error.response?.data as { error?: { message?: string } })?.error?.message;
@@ -758,13 +917,20 @@ export class VercelProvider {
     const credentials = await this.getCredentials();
 
     try {
-      await axios.delete(
-        `https://api.vercel.com/v9/projects/${credentials.projectId}/domains/${domain}?teamId=${credentials.teamId}`,
-        { headers: { Authorization: `Bearer ${credentials.token}` } }
+      await withVercelRateLimitRetry(
+        () =>
+          axios.delete(
+            `https://api.vercel.com/v9/projects/${credentials.projectId}/domains/${domain}?teamId=${credentials.teamId}`,
+            { headers: { Authorization: `Bearer ${credentials.token}` } }
+          ),
+        DEFAULT_VERCEL_RATE_LIMIT_OPTS
       );
 
       logger.info('Custom domain removed from Vercel project', { domain });
     } catch (error) {
+      if (error instanceof AppError) {
+        throw error;
+      }
       if (axios.isAxiosError(error) && error.response?.status === 404) {
         // Domain not found on Vercel side – treat as already removed
         return;
@@ -788,10 +954,14 @@ export class VercelProvider {
     const credentials = await this.getCredentials();
 
     try {
-      const response = await axios.post(
-        `https://api.vercel.com/v9/projects/${credentials.projectId}/domains/${domain}/verify?teamId=${credentials.teamId}`,
-        {},
-        { headers: { Authorization: `Bearer ${credentials.token}` } }
+      const response = await withVercelRateLimitRetry(
+        () =>
+          axios.post(
+            `https://api.vercel.com/v9/projects/${credentials.projectId}/domains/${domain}/verify?teamId=${credentials.teamId}`,
+            {},
+            { headers: { Authorization: `Bearer ${credentials.token}` } }
+          ),
+        DEFAULT_VERCEL_RATE_LIMIT_OPTS
       );
 
       const data = response.data as {
@@ -802,6 +972,9 @@ export class VercelProvider {
       logger.info('Custom domain verification result', { domain, verified: data.verified });
       return data;
     } catch (error) {
+      if (error instanceof AppError) {
+        throw error;
+      }
       if (axios.isAxiosError(error) && error.response?.status === 404) {
         throw new AppError(`Domain not found on Vercel: ${domain}`, 404, ERROR_CODES.NOT_FOUND);
       }
@@ -821,32 +994,180 @@ export class VercelProvider {
     const credentials = await this.getCredentials();
     const sha = this.computeSha(fileContent);
 
+    for (let attempt = 0; attempt <= UPLOAD_MAX_RETRIES; attempt++) {
+      try {
+        await axios.post(
+          `https://api.vercel.com/v2/files?teamId=${credentials.teamId}`,
+          fileContent,
+          {
+            headers: {
+              Authorization: `Bearer ${credentials.token}`,
+              'Content-Type': 'application/octet-stream',
+              'Content-Length': fileContent.length.toString(),
+              'x-vercel-digest': sha,
+            },
+          }
+        );
+
+        logger.info('File uploaded to Vercel', { sha, size: fileContent.length });
+        return sha;
+      } catch (error) {
+        // 409 Conflict means file already exists (same SHA), which is fine
+        if (axios.isAxiosError(error) && error.response?.status === 409) {
+          logger.info('File already exists on Vercel', { sha });
+          return sha;
+        }
+
+        // 429 Rate limit -- retry with exponential backoff + jitter
+        // Vercel uses X-RateLimit-Reset (Unix epoch seconds) instead of Retry-After
+        if (axios.isAxiosError(error) && error.response?.status === 429) {
+          if (attempt < UPLOAD_MAX_RETRIES) {
+            const rateLimitReset = error.response.headers['x-ratelimit-reset'];
+            const parsedReset = rateLimitReset ? parseInt(rateLimitReset, 10) : NaN;
+            let baseDelay: number;
+            if (!isNaN(parsedReset)) {
+              const resetMs = parsedReset * 1000;
+              baseDelay = Math.min(
+                Math.max(resetMs - Date.now(), UPLOAD_BACKOFF_BASE_MS),
+                UPLOAD_BACKOFF_MAX_MS
+              );
+            } else {
+              baseDelay = Math.min(2 ** attempt * UPLOAD_BACKOFF_BASE_MS, UPLOAD_BACKOFF_MAX_MS);
+            }
+            const delay = baseDelay + Math.random() * UPLOAD_JITTER_MAX_MS;
+
+            logger.warn('Vercel rate limit hit, retrying file upload', {
+              sha,
+              attempt: attempt + 1,
+              maxRetries: UPLOAD_MAX_RETRIES,
+              delayMs: Math.round(delay),
+            });
+
+            await new Promise((resolve) => setTimeout(resolve, delay));
+            continue;
+          }
+
+          logger.error('Vercel rate limit exceeded after retries', {
+            sha,
+            attempts: UPLOAD_MAX_RETRIES + 1,
+          });
+          throw new AppError(
+            'Vercel rate limit exceeded for file upload. Wait a moment and retry the deployment.',
+            429,
+            ERROR_CODES.RATE_LIMITED
+          );
+        }
+
+        logger.error('Failed to upload file to Vercel', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        throw new AppError('Failed to upload file to Vercel', 500, ERROR_CODES.INTERNAL_ERROR);
+      }
+    }
+
+    // Unreachable, but TypeScript needs a return
+    throw new AppError('Failed to upload file to Vercel', 500, ERROR_CODES.INTERNAL_ERROR);
+  }
+
+  /**
+   * Stream a single file to Vercel
+   * POST /v2/files
+   */
+  async uploadFileStream(input: {
+    content: Readable;
+    sha: string;
+    size: number;
+    signal?: AbortSignal;
+  }): Promise<string> {
+    const credentials = await this.getCredentials();
+    const { controller: uploadAbortController, cleanup } = this.createUploadAbortController(
+      input.signal
+    );
+
     try {
       await axios.post(
         `https://api.vercel.com/v2/files?teamId=${credentials.teamId}`,
-        fileContent,
+        input.content,
         {
           headers: {
             Authorization: `Bearer ${credentials.token}`,
             'Content-Type': 'application/octet-stream',
-            'Content-Length': fileContent.length.toString(),
-            'x-vercel-digest': sha,
+            'Content-Length': input.size.toString(),
+            'x-vercel-digest': input.sha,
           },
+          maxBodyLength: Infinity,
+          maxContentLength: Infinity,
+          timeout: VERCEL_UPLOAD_TIMEOUT_MS,
+          signal: uploadAbortController.signal,
         }
       );
 
-      logger.info('File uploaded to Vercel', { sha, size: fileContent.length });
-      return sha;
+      logger.info('File streamed to Vercel', { sha: input.sha, size: input.size });
+      return input.sha;
     } catch (error) {
-      // 409 Conflict means file already exists (same SHA), which is fine
-      if (axios.isAxiosError(error) && error.response?.status === 409) {
-        logger.info('File already exists on Vercel', { sha });
-        return sha;
+      if (error instanceof AppError) {
+        throw error;
       }
-      logger.error('Failed to upload file to Vercel', {
+
+      if (this.isUploadTimeoutError(error)) {
+        uploadAbortController.abort(
+          new Error(`Vercel file upload timed out after ${VERCEL_UPLOAD_TIMEOUT_MS}ms.`)
+        );
+        if (!input.content.destroyed) {
+          input.content.destroy();
+        }
+
+        logger.warn('Vercel timed out streamed file upload', {
+          sha: input.sha,
+          size: input.size,
+          timeoutMs: VERCEL_UPLOAD_TIMEOUT_MS,
+        });
+        throw new AppError(
+          `Vercel file upload timed out after ${VERCEL_UPLOAD_TIMEOUT_MS}ms. Retry the file upload.`,
+          504,
+          ERROR_CODES.INTERNAL_ERROR
+        );
+      }
+
+      // 409 Conflict means file already exists (same SHA), which is fine.
+      if (axios.isAxiosError(error) && error.response?.status === 409) {
+        logger.info('File already exists on Vercel', { sha: input.sha });
+        return input.sha;
+      }
+
+      // Streaming uploads cannot be safely retried because the request body has
+      // already been consumed. The client should retry with a fresh request.
+      if (axios.isAxiosError(error) && error.response?.status === 429) {
+        logger.warn('Vercel rate limit hit for streamed file upload', { sha: input.sha });
+        throw new AppError(
+          'Vercel rate limit exceeded for file upload. Wait a moment and retry the file upload.',
+          429,
+          ERROR_CODES.RATE_LIMITED
+        );
+      }
+
+      if (axios.isAxiosError(error) && error.response?.status === 400) {
+        logger.warn('Vercel rejected streamed file upload', {
+          sha: input.sha,
+          status: error.response.status,
+        });
+        throw new AppError(
+          'Uploaded file content does not match the registered deployment file.',
+          400,
+          ERROR_CODES.INVALID_INPUT
+        );
+      }
+
+      if (axios.isAxiosError(error) && error.code === 'ERR_CANCELED') {
+        throw new AppError('Vercel file upload was interrupted.', 499, ERROR_CODES.INVALID_INPUT);
+      }
+
+      logger.error('Failed to stream file to Vercel', {
         error: error instanceof Error ? error.message : String(error),
       });
       throw new AppError('Failed to upload file to Vercel', 500, ERROR_CODES.INTERNAL_ERROR);
+    } finally {
+      cleanup();
     }
   }
 
@@ -856,11 +1177,10 @@ export class VercelProvider {
   async uploadFiles(
     files: Array<{ path: string; content: Buffer }>
   ): Promise<Array<{ file: string; sha: string; size: number }>> {
-    const maxConcurrency = 10;
     const results: Array<{ file: string; sha: string; size: number }> = [];
 
-    for (let i = 0; i < files.length; i += maxConcurrency) {
-      const batch = files.slice(i, i + maxConcurrency);
+    for (let i = 0; i < files.length; i += UPLOAD_BATCH_SIZE) {
+      const batch = files.slice(i, i + UPLOAD_BATCH_SIZE);
       const batchResults = await Promise.all(
         batch.map(async ({ path, content }) => {
           const sha = await this.uploadFile(content);
@@ -868,6 +1188,11 @@ export class VercelProvider {
         })
       );
       results.push(...batchResults);
+
+      // Delay between batches to avoid triggering rate limits
+      if (i + UPLOAD_BATCH_SIZE < files.length) {
+        await new Promise((resolve) => setTimeout(resolve, UPLOAD_INTER_BATCH_DELAY_MS));
+      }
     }
 
     return results;

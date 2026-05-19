@@ -10,7 +10,7 @@ import {
   type RenderCellProps,
   type DataGridColumn,
   type DataGridRowType,
-} from '../../../components';
+} from '#components';
 import {
   Download,
   Eye,
@@ -24,13 +24,13 @@ import {
   Folder,
 } from 'lucide-react';
 import { StorageFileSchema } from '@insforge/shared-schemas';
-import { cn, formatTime } from '../../../lib/utils/utils';
-import { useStorage } from '../hooks/useStorage';
+import { cn, formatTime } from '#lib/utils/utils';
+import { useStorageObjects } from '#features/storage/hooks/useStorageObjects';
 import { FilePreviewDialog } from './FilePreviewDialog';
-import { useConfirm } from '../../../lib/hooks/useConfirm';
-import { useToast } from '../../../lib/hooks/useToast';
+import { useConfirm } from '#lib/hooks/useConfirm';
+import { useToast } from '#lib/hooks/useToast';
 import { SortColumn } from 'react-data-grid';
-import { usePageSize } from '../../../lib/hooks/usePageSize';
+import { usePageSize } from '#lib/hooks/usePageSize';
 
 // Create a type that makes StorageFileSchema compatible with DataGridRowType
 // This allows StorageFileSchema to be used with the generic DataGrid while maintaining type safety
@@ -313,7 +313,7 @@ export function StorageDataGrid({
     setCurrentPage(1);
   }, [searchQuery, bucketName]);
 
-  const { useListObjects, deleteObjects, downloadObject } = useStorage();
+  const { useListObjects, deleteObjects, downloadObject } = useStorageObjects();
   const {
     data: objectsData,
     isLoading: objectsLoading,

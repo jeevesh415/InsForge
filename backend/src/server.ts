@@ -20,6 +20,8 @@ import { realtimeRouter } from '@/api/routes/realtime/index.routes.js';
 import { emailRouter } from '@/api/routes/email/index.routes.js';
 import { deploymentsRouter } from '@/api/routes/deployments/index.routes.js';
 import { webhooksRouter } from '@/api/routes/webhooks/index.routes.js';
+import { s3GatewayRouter } from '@/api/routes/s3-gateway/index.routes.js';
+import { paymentsRouter } from '@/api/routes/payments/index.routes.js';
 import { errorMiddleware } from '@/api/middlewares/error.js';
 import { destroyEmailCooldownInterval } from '@/api/middlewares/rate-limiters.js';
 import { isCloudEnvironment } from '@/utils/environment.js';
@@ -36,8 +38,20 @@ import { initSqlParser } from '@/utils/sql-parser.js';
 import { FunctionService } from '@/services/functions/function.service.js';
 import packageJson from '../../package.json';
 import { schedulesRouter } from '@/api/routes/schedules/index.routes.js';
+import { servicesRouter } from '@/api/routes/compute/services.routes.js';
+import { posthogRouter } from '@/api/routes/posthog/index.routes.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+function shouldSkipGlobalRateLimit(req: Request): boolean {
+  if (req.path === '/api/health') {
+    return true;
+  }
+
+  return (
+    req.method === 'PUT' && /^\/api\/deployments\/[^/]+\/files\/[^/]+\/content$/.test(req.path)
+  );
+}
 
 // Load .env file from the root directory (parent of backend)
 const envPath = path.resolve(__dirname, '../../.env');
@@ -73,7 +87,7 @@ export async function createApp() {
     windowMs: 15 * 60 * 1000,
     max: 3000,
     message: 'Too many requests from this IP',
-    skip: (req) => req.path === '/api/health',
+    skip: shouldSkipGlobalRateLimit,
   });
 
   // Basic middleware
@@ -159,6 +173,11 @@ export async function createApp() {
   // This ensures signature verification uses the original bytes
   app.use('/api/webhooks', express.raw({ type: 'application/json' }), webhooksRouter);
 
+  // Mount the S3 protocol gateway BEFORE JSON middleware so request bodies
+  // stream through untouched. The gateway handles raw streams itself
+  // (including STREAMING-AWS4-HMAC-SHA256-PAYLOAD chunked signatures).
+  app.use('/storage/v1/s3', s3GatewayRouter);
+
   // Apply JSON and URL-encoded middleware for all other routes.
   // We use high defaults (100mb/10mb) to ensure a smooth "out-of-the-box" experience
   // for large metadata/storage requests, as per project standards.
@@ -197,6 +216,9 @@ export async function createApp() {
   apiRouter.use('/email', emailRouter);
   apiRouter.use('/deployments', deploymentsRouter);
   apiRouter.use('/schedules', schedulesRouter);
+  apiRouter.use('/payments', paymentsRouter);
+  apiRouter.use('/compute/services', servicesRouter);
+  apiRouter.use('/integrations/posthog', posthogRouter);
 
   // Mount all API routes under /api prefix
   app.use('/api', apiRouter);
